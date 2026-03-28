@@ -4,15 +4,15 @@ from config import (ACTION_DELAY, GRIP_OPEN, GRIP_CLOSE, CENTER_TOLERANCE,
                     DROP_ZONES, DROP_SHOULDER, DROP_ELBOW,
                     SPEED_TRACK_STEPS, SPEED_TRACK_DELAY,
                     SPEED_MOVE_STEPS, SPEED_MOVE_DELAY,
-                    SPEED_CARRY_STEPS, SPEED_CARRY_DELAY)
+                    SPEED_CARRY_STEPS, SPEED_CARRY_DELAY,
+                    APPROACH_NEAR_Y, APPROACH_FAR_Y,
+                    APPROACH_NEAR_SH, APPROACH_NEAR_EL,
+                    APPROACH_FAR_SH, APPROACH_FAR_EL)
 from arm_controller import RoboticArmController
 
 ANGLE_DEADZONE       = 3
 HOLD_RELEASE_TIMEOUT = 3.0
 COAST_TIMEOUT        = 1.5
-
-# Сколько секунд держим состояние после перехода, прежде чем разрешить сброс
-# Нужно чтобы не сбрасываться в той же итерации где только что сменили состояние
 TRANSITION_GUARD     = 0.5
 
 class GrabController:
@@ -25,26 +25,35 @@ class GrabController:
         self.hold_lost_time       = None
         self.grabbed_class        = None
 
-        self.safe_angles = {'shoulder': 90,  'elbow': 90}
-        self.grab_angles = {'shoulder': 110, 'elbow': 80}
+        self.safe_angles = {'shoulder': 90, 'elbow': 90}
 
-        self._last_known_obj  = None
-        self._last_seen_time  = None
-        self._state_entered_time = time.time()  # когда вошли в текущее состояние
+        self._last_known_obj     = None
+        self._last_seen_time     = None
+        self._state_entered_time = time.time()
 
     def can_act(self):
         return time.time() - self.last_action_time > self.action_delay
 
     def _set_state(self, new_state):
-        """Смена состояния с фиксацией времени входа."""
         if self.state != new_state:
             print(f"  → {new_state}")
             self.state = new_state
             self._state_entered_time = time.time()
 
     def _in_new_state(self):
-        """True если состояние сменилось совсем недавно — не сбрасываем."""
         return time.time() - self._state_entered_time < TRANSITION_GUARD
+
+    def reset(self):
+        print("🔄 СБРОС → TRACK")
+        self.state                = "TRACK"
+        self.last_action_time     = time.time()
+        self.first_detection_time = None
+        self.hold_lost_time       = None
+        self.grabbed_class        = None
+        self._last_known_obj      = None
+        self._last_seen_time      = None
+        self._state_entered_time  = time.time()
+        self.arm.go_home()
 
     def _get_base_from_obj(self, obj):
         if obj is not None:
@@ -52,13 +61,35 @@ class GrabController:
             return self.arm.calculate_base_angle_from_pixel(cx)
         return self.arm.current_angles['base']
 
+    def _get_approach_angles(self, obj):
+        """
+        Вычисляет углы плеча и локтя для захвата сверху
+        на основе Y-координаты объекта в кадре.
+        Ближе к низу кадра (большой Y) = объект близко = NEAR-углы.
+        Ближе к верху кадра (малый Y)  = объект далеко = FAR-углы.
+        """
+        if obj is None:
+            return APPROACH_NEAR_SH, APPROACH_NEAR_EL
+
+        _, cy = obj['center']
+
+        # Клампируем Y в диапазон калибровки
+        cy = max(APPROACH_FAR_Y, min(APPROACH_NEAR_Y, cy))
+
+        # t=0 → далеко (верх кадра), t=1 → близко (низ кадра)
+        t = (cy - APPROACH_FAR_Y) / max(APPROACH_NEAR_Y - APPROACH_FAR_Y, 1)
+
+        shoulder = APPROACH_FAR_SH + (APPROACH_NEAR_SH - APPROACH_FAR_SH) * t
+        elbow    = APPROACH_FAR_EL + (APPROACH_NEAR_EL - APPROACH_FAR_EL) * t
+
+        return int(shoulder), int(elbow)
+
     def _drop_base_angle(self):
         if self.grabbed_class and self.grabbed_class in DROP_ZONES:
             return DROP_ZONES[self.grabbed_class]
         return self.arm.current_angles['base']
 
     def _resolve_obj(self, obj):
-        """Возвращает объект с учётом coasting при кратковременной потере."""
         if obj is not None:
             self._last_known_obj = obj
             self._last_seen_time = time.time()
@@ -94,11 +125,12 @@ class GrabController:
                 self._last_known_obj = None
                 self._last_seen_time = None
 
-        # ── APPROACH ─────────────────────────────────────────────────────────
+        # ── APPROACH: опускаемся над объектом сверху ─────────────────────────
         elif self.state == "APPROACH" and self.can_act():
             base = self._get_base_from_obj(obj)
-            self.arm.move_smooth(base, self.grab_angles['shoulder'],
-                                 self.grab_angles['elbow'], GRIP_OPEN,
+            sh, el = self._get_approach_angles(obj)
+            print(f"📐 Подход сверху: base={base}° shoulder={sh}° elbow={el}°")
+            self.arm.move_smooth(base, sh, el, GRIP_OPEN,
                                  steps=SPEED_MOVE_STEPS, delay=SPEED_MOVE_DELAY)
             self._set_state("GRAB")
             self.last_action_time = time.time()
@@ -106,11 +138,11 @@ class GrabController:
         # ── GRAB ─────────────────────────────────────────────────────────────
         elif self.state == "GRAB" and self.can_act():
             base = self._get_base_from_obj(obj)
+            sh, el = self._get_approach_angles(obj)
             if obj is not None:
                 self.grabbed_class = obj['class_name']
                 print(f"🤏 Захват: {self.grabbed_class} → зона {DROP_ZONES.get(self.grabbed_class, '?')}°")
-            self.arm.move_smooth(base, self.grab_angles['shoulder'],
-                                 self.grab_angles['elbow'], GRIP_CLOSE,
+            self.arm.move_smooth(base, sh, el, GRIP_CLOSE,
                                  steps=SPEED_MOVE_STEPS, delay=SPEED_MOVE_DELAY)
             self._set_state("LIFT")
             self.last_action_time = time.time()
@@ -171,9 +203,6 @@ class GrabController:
                 self.hold_lost_time = None
 
         # ── Сброс при потере в промежуточных состояниях ───────────────────────
-        # Не срабатывает если:
-        #   - состояние только что сменилось (TRANSITION_GUARD)
-        #   - объект недавно видели (COAST_TIMEOUT)
         if (raw_obj is None
                 and self.state in ("APPROACH", "GRAB", "LIFT")
                 and not self._in_new_state()

@@ -2,7 +2,7 @@ import cv2
 import math
 import numpy as np
 from ultralytics import YOLO
-from config import YOLO_MODEL_PATH, CLASS_NAMES, CAMERA_WIDTH, CAMERA_HEIGHT, CENTER_TOLERANCE
+from config import YOLO_MODEL_PATH, CLASS_NAMES, CAMERA_WIDTH, CAMERA_HEIGHT, CENTER_TOLERANCE, BBOX_AREA_MIN, BBOX_AREA_MAX
 
 class Vision:
     def __init__(self):
@@ -25,6 +25,9 @@ class Vision:
                 conf = math.ceil(box.conf[0] * 100) / 100
                 cls = int(box.cls[0])
                 if conf < 0.5:
+                    continue
+                area = (x2 - x1) * (y2 - y1)
+                if area < BBOX_AREA_MIN or area > BBOX_AREA_MAX:
                     continue
                 center = ((x1 + x2) // 2, (y1 + y2) // 2)
                 # Проверка слепой зоны
@@ -67,6 +70,9 @@ class Vision:
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             label = f"{obj['class_name']}: {obj['confidence']:.2f}"
             cv2.putText(frame, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            # площадь bbox — поможет подобрать BBOX_AREA_MAX
+            area = (x2 - x1) * (y2 - y1)
+            cv2.putText(frame, f"area:{area}", (x1, y2+15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
 
         # Центральная линия и допуск
         h, w = frame.shape[:2]
